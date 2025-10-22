@@ -1,0 +1,13 @@
+import "EboASR.idsl";
+import "LEDArray.idsl";
+
+Component ebo_asr
+{
+    Communications
+    {
+        implements EboASR;
+        requires LEDArray;
+    };
+    language python;
+};
+

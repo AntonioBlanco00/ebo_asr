@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.ENV/
+.mypy_cache/
+.pytest_cache/
+
+# --- Audio temporales ---
+ebo_asr_*.wav
+
+# --- Entorno / secretos ---
+.env
+
+# --- CMake / build (limpia artefactos generados) ---
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+/build/
+src/CMakeFiles/
+src/cmake_install.cmake
+src/Makefile
+
+# --- Sistemas / IDEs ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

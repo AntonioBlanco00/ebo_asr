@@ -1,0 +1,14 @@
+# Endpoints for implements interfaces
+EboASR.Endpoints=tcp -p 13455
+
+# Proxies for required interfaces
+LEDArrayProxy = ledarray:tcp -h localhost -p 10991
+
+
+Ice.Warn.Connections=0
+Ice.Trace.Network=0
+Ice.Trace.Protocol=0
+Ice.MessageSizeMax=20004800
+
+
+
