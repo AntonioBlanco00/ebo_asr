@@ -185,9 +185,7 @@ class SpecificWorker(GenericWorker):
     
     @QtCore.Slot()
     def compute(self):
-        input("Pulsa ENTER para probar WHISPER")
-        texto = self.EboASR_listenandtranscript()   # <- antes llamaba a record_wav_from_mic()
-        print(f"[ASR] {texto}")
+
         return True
 
     def startup_check(self):
