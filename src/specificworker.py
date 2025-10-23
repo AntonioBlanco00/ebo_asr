@@ -32,6 +32,8 @@ import webrtcvad
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
+from collections import deque
+
 
 from pathlib import Path
 
@@ -93,13 +95,16 @@ class SpecificWorker(GenericWorker):
         except Exception as e:
             print(f"[LED] No se pudo apagar LEDs: {e}", file=sys.stderr)
             
+
     def record_wav_until_silence(self,
-                                 max_duration_s: float = 12.0,
-                                 max_silence_s: float = 0.8,
-                                 samplerate: int = 16_000,
-                                 channels: int = 1,
-                                 frame_ms: int = 30,
-                                 vad_aggressiveness: int = 2) -> str:
+                                end_silence_s: float = 0.7,
+                                samplerate: int = 16_000,
+                                channels: int = 1,
+                                frame_ms: int = 30,
+                                vad_aggressiveness: int = 3,
+                                pre_roll_s: float = 0.3,
+                                activation_speech_ms: int = 200,
+                                post_speech_max_duration_s: float = 12.0) -> str:
 
         if frame_ms not in (10, 20, 30):
             raise ValueError("frame_ms debe ser 10, 20 o 30 para webrtcvad")
@@ -115,56 +120,78 @@ class SpecificWorker(GenericWorker):
                 print(f"[AUDIO] {status}", file=sys.stderr)
             q.put(indata.copy())
 
-        # Fichero temporal .wav
-        tmp = tempfile.NamedTemporaryFile(prefix="ebo_asr_", suffix=".wav", delete=False)
+        tmp = tempfile.NamedTemporaryFile(prefix="ebo_asr_", suffix=".flac", delete=False)
         wav_path = Path(tmp.name)
         tmp.close()
 
         vad = webrtcvad.Vad(vad_aggressiveness)
         blocksize = int(samplerate * frame_ms / 1000)
 
+        # Buffer circular para conservar pre-roll
+        pre_frames = max(0, int(round(pre_roll_s * 1000 / frame_ms)))
+        pre_buffer = deque(maxlen=pre_frames)
+
         self.led_listening_on()
-        start_time = time.time()
+        started = False
+        speech_streak_ms = 0
         last_voice_time = None
-        heard_any_speech = False
+        speech_start_time = None
 
         try:
             with sf.SoundFile(str(wav_path), mode='w',
-                              samplerate=samplerate,
-                              channels=channels,
-                              subtype='PCM_16') as wav, \
-                 sd.InputStream(samplerate=samplerate,
+                            samplerate=samplerate,
+                            channels=channels,
+                            format='FLAC',
+                            subtype='PCM_16') as wav, \
+                sd.InputStream(samplerate=samplerate,
                                 channels=channels,
                                 dtype='int16',
                                 blocksize=blocksize,
                                 callback=_callback):
 
-                print(f"[AUDIO] Escuchando (VAD), máx {max_duration_s:.1f}s → {wav_path}")
-                while True:
-                    # Salida por timeout total
-                    now = time.time()
-                    if (now - start_time) >= max_duration_s:
-                        break
+                print(f"[AUDIO] Waiting for voice (infinite). activation>={activation_speech_ms}ms, "
+                    f"end_silence={end_silence_s:.2f}s, post_limit={post_speech_max_duration_s:.1f}s → {wav_path}")
 
-                    chunk = q.get()  # forma: (blocksize, 1)
+                while True:
+                    chunk = q.get()
+                    now = time.time()
+                    is_speech = vad.is_speech(chunk.tobytes(), samplerate)
+
+                    if not started:
+                        # Antes de activar: rellenamos pre-buffer y exigimos racha de voz
+                        pre_buffer.append(chunk)
+                        if is_speech:
+                            speech_streak_ms += frame_ms
+                            if speech_streak_ms >= activation_speech_ms:
+                                # ACTIVACIÓN: volcamos el pre-roll (incluye el chunk actual) y arrancamos
+                                for b in pre_buffer:
+                                    wav.write(b)
+                                pre_buffer.clear()
+                                started = True
+                                speech_start_time = now
+                                last_voice_time = now
+                        else:
+                            speech_streak_ms = 0
+                        continue
+
+                    # Ya activado: escribimos todo
                     wav.write(chunk)
 
-                    # VAD (bytes PCM16 little-endian)
-                    chunk_bytes = chunk.tobytes()
-                    is_speech = vad.is_speech(chunk_bytes, samplerate)
-
                     if is_speech:
-                        heard_any_speech = True
                         last_voice_time = now
                     else:
-                        if heard_any_speech and last_voice_time is not None:
-                            if (now - last_voice_time) >= max_silence_s:
-                                # silencio suficiente tras haber oído voz
-                                break
+                        if last_voice_time is not None and (now - last_voice_time) >= end_silence_s:
+                            break
+
+                    # Límite duro tras empezar voz
+                    if (now - speech_start_time) >= post_speech_max_duration_s:
+                        break
+
         finally:
             self.led_listening_off()
 
         return str(wav_path)
+
 
     def transcribe_with_whisper(self, wav_path: str,
                                 model: str = "whisper-1",
@@ -209,15 +236,18 @@ class SpecificWorker(GenericWorker):
         try:
             # 1) Escuchar hasta silencio o timeout
             wav_path = self.record_wav_until_silence(
-                max_duration_s=12.0,
-                max_silence_s=0.8,
+                end_silence_s=0.7,              # silencio para cortar
                 samplerate=16_000,
                 channels=1,
                 frame_ms=30,
-                vad_aggressiveness=2
+                vad_aggressiveness=3,           # más estricto reduce falsos positivos
+                pre_roll_s=0.3,                 # audio previo que se guarda; pon 0.0 si no lo quieres
+                activation_speech_ms=200,       # exige 200 ms de voz consecutiva para activar
+                post_speech_max_duration_s=12.0 # límite duro tras empezar voz
             )
+
             # 2) Transcribir con Whisper
-            ret = self.transcribe_with_whisper(wav_path, model="whisper-1", language="es")
+            ret = self.transcribe_with_whisper(wav_path, model="gpt-4o-mini-transcribe", language="es")
             return ret.strip()
         
         finally:
@@ -240,5 +270,6 @@ class SpecificWorker(GenericWorker):
     ######################
     # From the RoboCompLEDArray you can use this types:
     # RoboCompLEDArray.Pixel
+
 
 
