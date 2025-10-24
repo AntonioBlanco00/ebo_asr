@@ -59,6 +59,8 @@ class SpecificWorker(GenericWorker):
         load_dotenv()
         self.openai_client = OpenAI()
         
+        self._is_listening = False
+        
         if startup_check:
             self.startup_check()
         else:
@@ -118,7 +120,11 @@ class SpecificWorker(GenericWorker):
         def _callback(indata, frames, _time, status):
             if status:
                 print(f"[AUDIO] {status}", file=sys.stderr)
-            q.put(indata.copy())
+            
+            # Solo ponemos datos en la cola si estamos escuchando
+            if self._is_listening: 
+                 q.put(indata.copy())
+            
 
         tmp = tempfile.NamedTemporaryFile(prefix="ebo_asr_", suffix=".flac", delete=False)
         wav_path = Path(tmp.name)
@@ -131,7 +137,11 @@ class SpecificWorker(GenericWorker):
         pre_frames = max(0, int(round(pre_roll_s * 1000 / frame_ms)))
         pre_buffer = deque(maxlen=pre_frames)
 
-        self.led_listening_on()
+        # La luz de escucha se enciende si la bandera está activa al inicio
+        should_run = self._is_listening 
+        if should_run:
+            self.led_listening_on()
+
         started = False
         speech_streak_ms = 0
         last_voice_time = None
@@ -152,10 +162,22 @@ class SpecificWorker(GenericWorker):
                 print(f"[AUDIO] Waiting for voice (infinite). activation>={activation_speech_ms}ms, "
                     f"end_silence={end_silence_s:.2f}s, post_limit={post_speech_max_duration_s:.1f}s → {wav_path}")
 
-                while True:
-                    chunk = q.get()
+                # El bucle revisa continuamente la bandera de interrupción
+                while self._is_listening:
+                    # Usamos timeout=0.1s para poder revisar la bandera self._is_listening
+                    try:
+                        chunk = q.get(timeout=0.1) 
+                    except queue.Empty:
+                        if not self._is_listening:
+                            break # Salir si el timeout expira y la bandera es False
+                        continue
+                        
                     now = time.time()
                     is_speech = vad.is_speech(chunk.tobytes(), samplerate)
+                    
+                    # Revisión de interrupción tras obtener chunk
+                    if not self._is_listening:
+                        break 
 
                     if not started:
                         # Antes de activar: rellenamos pre-buffer y exigimos racha de voz
@@ -188,7 +210,9 @@ class SpecificWorker(GenericWorker):
                         break
 
         finally:
-            self.led_listening_off()
+            # Apagamos los LEDs SÓLO si entramos en el bucle
+            if should_run:
+                self.led_listening_off()
 
         return str(wav_path)
 
@@ -233,30 +257,50 @@ class SpecificWorker(GenericWorker):
     def EboASR_listenandtranscript(self):
         ret = str()
         wav_path = None
+        
+        # PASO 1: Establecer la bandera de inicio
+        self._is_listening = True 
+        
         try:
-            # 1) Escuchar hasta silencio o timeout
+            # 1) Escuchar hasta silencio o timeout (o interrupción)
             wav_path = self.record_wav_until_silence(
                 end_silence_s=0.7,              # silencio para cortar
                 samplerate=16_000,
                 channels=1,
                 frame_ms=30,
                 vad_aggressiveness=3,           # más estricto reduce falsos positivos
-                pre_roll_s=0.3,                 # audio previo que se guarda; pon 0.0 si no lo quieres
+                pre_roll_s=0.3,                 # audio previo que se guarda
                 activation_speech_ms=200,       # exige 200 ms de voz consecutiva para activar
                 post_speech_max_duration_s=12.0 # límite duro tras empezar voz
             )
 
-            # 2) Transcribir con Whisper
-            ret = self.transcribe_with_whisper(wav_path, model="gpt-4o-mini-transcribe", language="es")
-            return ret.strip()
+            # 2) Transcribir con Whisper, SÓLO si la bandera sigue activa (no se ha pedido parar)
+            if self._is_listening and wav_path and Path(wav_path).exists() and Path(wav_path).stat().st_size > 0:
+                ret = self.transcribe_with_whisper(wav_path, model="gpt-4o-mini-transcribe", language="es")
+                return ret.strip()
+            else:
+                 # Si se interrumpió, devolvemos vacío.
+                 return ""
         
         finally:
-            # 3) Borrar el WAV temporal
+            # 3) Bandera de limpieza y borrado del WAV
+            self._is_listening = False # Asegura que la bandera se resetee al terminar
             try:
                 if wav_path:
                     Path(wav_path).unlink(missing_ok=True)
             except Exception:
                 pass
+
+    #
+    # IMPLEMENTATION of stopListening method from EboASR interface
+    #
+    
+    # Función para detener la escucha de forma cooperativa.
+    def EboASR_stopListening(self):
+        if self._is_listening:
+            self._is_listening = False
+            print("[EboASR] Señal de stopListening recibida. Forzando salida.")
+        pass
 
     # ===================================================================
     # ===================================================================

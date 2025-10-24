@@ -40,3 +40,6 @@ class EboASRI(EboASR):
 
     def listenandtranscript(self, c):
         return self.worker.EboASR_listenandtranscript()
+
+    def stopListening(self, c):
+        return self.worker.EboASR_stopListening()
